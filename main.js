@@ -11,7 +11,95 @@ class MotherDuckFileBrowser {
         });
         this.bucket = bucket;
     }
-    
+
+    buildTableFromQueryResult (data) {
+        const columns = data.columnNames(),
+              rows = data.toRows();
+
+        const table = document.createElement('table');
+        table.innerHTML = `<thead><tr></tr></thead><tbody></tbody>`;
+
+        table.querySelector('thead tr').innerHTML = columns.map(
+            column => `<th>${column}</th>`
+        ).join('\n');
+
+        const tbody = table.querySelector('tbody');
+        rows.forEach(row => {
+            const tr = document.createElement('tr');
+            tr.innerHTML = columns.map(
+                column => row[column] === null ? '' : row[column].toString()
+            ).map(
+                cell => `<td>${cell}</td>`
+            ).join('\n');
+            tbody.append(tr);
+        });
+
+        return table;
+    }
+
+    getFullPath (treeItem) {
+        const parts = [];
+
+        // Start with current item's text content, trimmed to remove extra spaces
+        parts.push(treeItem.textContent.trim());
+
+        // Walk up the tree looking for parent sl-tree-items
+        let current = treeItem;
+        while (current) {
+            // Find the next parent sl-tree-item
+            current = current.parentElement.closest('sl-tree-item');
+            if (current) {
+                // Get just the folder name by:
+                // 1. Getting the text content
+                // 2. Removing children's text by removing all nested sl-tree-items
+                const clone = current.cloneNode(true);
+                clone.querySelectorAll('sl-tree-item').forEach(el => el.remove());
+                const folderName = clone.textContent.trim();
+
+                parts.unshift(folderName);
+            }
+        }
+
+        return `s3://${this.bucket}/${parts.join('/')}`;
+    }
+
+    async handleFileClick (e) {
+        const item = e.target.closest('sl-tree-item');
+        if (!item) {
+            /* If the click was not within a tree item, we don't want it */
+            return;
+        }
+        if (item.querySelector('sl-tree-item')) {
+            /* If the clicked-on tree item has tree items, it's not a file, so we don't want it */
+            return;
+        }
+
+        const filePath = this.getFullPath(item);
+        const validExtensions = ['csv', 'parquet', 'json'],
+              suffix = filePath.split('.').pop().toLowerCase();
+
+        if (validExtensions.indexOf(suffix) === -1) {
+            /* The clicked-on tree item doesn't look like a data file, so we don't want it */
+            return;
+        }
+        e.stopPropagation();
+
+        const { data } = await this.connection.evaluateQuery(`
+          SELECT * FROM '${filePath}'
+        `);
+
+        const table = this.buildTableFromQueryResult(data);
+
+        /* Make sure we're cleaning up any old closed drawers first */
+        Array.from(document.querySelectorAll('sl-drawer.query-result')).forEach(el => el.remove());
+        const drawer = document.createElement('sl-drawer');
+        drawer.classList.add('query-result');
+        drawer.open = true;
+        drawer.style.setProperty('--size', '75vw');
+        drawer.append(table);
+        document.body.append(drawer);
+    }
+
     buildFileTree (files) {
         // First create a nested object structure
         const tree = {};
@@ -104,6 +192,7 @@ class MotherDuckFileBrowser {
             const div = document.createElement('div');
             div.innerHTML = tree;
             document.body.append(div);
+            div.querySelector('sl-tree').addEventListener('click', e => app.handleFileClick(e));
         });
 
         if (window.location.hash === '#tokenInClipboard=true') {

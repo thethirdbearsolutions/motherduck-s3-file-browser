@@ -1,18 +1,11 @@
-import { MDConnection } from '@motherduck/wasm-client';
+import { MDConnection, getAsyncDuckDb } from '@motherduck/wasm-client';
 
 const APP_URL = new URL(window.location);
 APP_URL.hash = '#tokenInClipboard=true';
 
 class MotherDuckFileBrowser {
 
-    constructor (mdToken, bucket) {
-        this.connection = MDConnection.create({
-            mdToken
-        });
-        this.bucket = bucket;
-    }
-
-    buildTableFromQueryResult (data) {
+    static buildTableFromQueryResult (data) {
         const columns = data.columnNames(),
               rows = data.toRows();
 
@@ -37,125 +30,6 @@ class MotherDuckFileBrowser {
         return table;
     }
 
-    getFullPath (treeItem) {
-        const parts = [];
-
-        // Start with current item's text content, trimmed to remove extra spaces
-        parts.push(treeItem.textContent.trim());
-
-        // Walk up the tree looking for parent sl-tree-items
-        let current = treeItem;
-        while (current) {
-            // Find the next parent sl-tree-item
-            current = current.parentElement.closest('sl-tree-item');
-            if (current) {
-                // Get just the folder name by:
-                // 1. Getting the text content
-                // 2. Removing children's text by removing all nested sl-tree-items
-                const clone = current.cloneNode(true);
-                clone.querySelectorAll('sl-tree-item').forEach(el => el.remove());
-                const folderName = clone.textContent.trim();
-
-                parts.unshift(folderName);
-            }
-        }
-
-        return `s3://${this.bucket}/${parts.join('/')}`;
-    }
-
-    async handleFileClick (e) {
-        const item = e.target.closest('sl-tree-item');
-        if (!item) {
-            /* If the click was not within a tree item, we don't want it */
-            return;
-        }
-        if (item.querySelector('sl-tree-item')) {
-            /* If the clicked-on tree item has tree items, it's not a file, so we don't want it */
-            return;
-        }
-
-        const filePath = this.getFullPath(item);
-        const validExtensions = ['csv', 'parquet', 'json'],
-              suffix = filePath.split('.').pop().toLowerCase();
-
-        if (validExtensions.indexOf(suffix) === -1) {
-            /* The clicked-on tree item doesn't look like a data file, so we don't want it */
-            return;
-        }
-        e.stopPropagation();
-
-        const { data } = await this.connection.evaluateQuery(`
-          SELECT * FROM '${filePath}'
-        `);
-
-        const table = this.buildTableFromQueryResult(data);
-
-        /* Make sure we're cleaning up any old closed drawers first */
-        Array.from(document.querySelectorAll('sl-drawer.query-result')).forEach(el => el.remove());
-        const drawer = document.createElement('sl-drawer');
-        drawer.classList.add('query-result');
-        drawer.open = true;
-        drawer.style.setProperty('--size', '75vw');
-        drawer.append(table);
-        document.body.append(drawer);
-    }
-
-    buildFileTree (files) {
-        // First create a nested object structure
-        const tree = {};
-        
-        files.forEach(({file}) => {
-            // Remove the s3:// prefix and split into parts
-            const parts = file.replace(`s3://${this.bucket}/`, '').split('/');
-            let current = tree;
-            
-            // Build nested object structure
-            parts.forEach((part, i) => {
-                if (i === parts.length - 1) {
-                    // It's a file
-                    current[part] = null;
-                } else {
-                    // It's a directory
-                    current[part] = current[part] || {};
-                }
-                current = current[part];
-            });
-        });
-
-        // Function to recursively build sl-tree-items
-        function buildTreeHTML(obj, name = '') {
-            if (obj === null) {
-                // File node
-                return `
-        <sl-tree-item>
-          ${name}
-        </sl-tree-item>`;
-            }
-            
-            // Directory node
-            const children = Object.entries(obj)
-                  .map(([key, value]) => buildTreeHTML(value, key))
-                  .join('');
-            
-            if (!name) {
-                // Root level - just return the tree
-                return `
-        <sl-tree>
-          ${children}
-        </sl-tree>`;
-            }
-            
-            return `
-      <sl-tree-item>
-        <sl-icon slot="expand-icon" name="folder"></sl-icon>
-        ${name}
-        ${children}
-      </sl-tree-item>`;
-        }
-
-        return buildTreeHTML(tree);
-    }
-    
     static async promptForToken () {
         const modal = document.createElement('sl-dialog');
         modal.label = "MotherDuck connection";
@@ -166,9 +40,6 @@ class MotherDuckFileBrowser {
             type="password" 
             name="token"
             password-toggle></sl-input>
-  <sl-input label="S3 bucket"
-            type="text"
-            name="bucket"></sl-input>
   <button type="submit">Save settings</button>
 </form>
         `;
@@ -179,20 +50,85 @@ class MotherDuckFileBrowser {
             e.preventDefault();
             modal.open = false;
             const form = new FormData(e.target),
-                  token = form.get('token'),
-                  bucket = form.get('bucket');
-             
-            const app = new MotherDuckFileBrowser(token, bucket);
-            const { data } = await app.connection.evaluateQuery(
-                `SELECT * FROM GLOB('s3://${bucket}/**')`
-            );
+                  mdToken = form.get('token');
+
+            const dropzone = document.createElement('div');
+            dropzone.classList.add('dropzone');
+            dropzone.textContent = "Initializing a database, hang on...";
+            document.body.append(dropzone);
             
-            const files = data.toRows();
-            const tree = app.buildFileTree(files);
-            const div = document.createElement('div');
-            div.innerHTML = tree;
-            document.body.append(div);
-            div.querySelector('sl-tree').addEventListener('click', e => app.handleFileClick(e));
+            const motherduck = MDConnection.create({
+                mdToken
+            });
+            const db = await getAsyncDuckDb({
+                mdToken
+            });
+
+            dropzone.textContent = "Ready when you are! Drop a CSV file and I'll tell you about it.";
+
+            ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+                dropzone.addEventListener(eventName, e => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                });
+            });
+
+            ['dragenter', 'dragover'].forEach(eventName => {
+                dropzone.addEventListener(eventName, () => {
+                    dropzone.style.backgroundColor = '#f0f0f0';
+                    dropzone.style.borderColor = '#999';
+                });
+            });
+
+            ['dragleave', 'drop'].forEach(eventName => {
+                dropzone.addEventListener(eventName, () => {
+                    dropzone.style.backgroundColor = '';
+                    dropzone.style.borderColor = '#ccc';
+                });
+            });
+
+            // Handle the actual file drop
+            dropzone.addEventListener('drop', async e => {
+                const file = e.dataTransfer.files[0];
+                if (!file || !file.name.toLowerCase().endsWith('.csv')) {
+                    dropzone.textContent = 'Please drop a CSV file';
+                    dropzone.classList.add('error');
+                    return;
+                }
+
+                try {
+                    dropzone.classList.remove('error');
+                    dropzone.textContent = 'Processing...';
+                    const buffer = new Uint8Array(await file.arrayBuffer());
+                    await db.registerFileBuffer(file.name, buffer);
+                    
+                    // Get file info
+                    const [sampleRows, countQuery] = await Promise.all([
+                        motherduck.evaluateQuery(`select * from '${file.name}' limit 25`),
+                        motherduck.evaluateQuery(`select count(*) as num_rows from '${file.name}'`)
+                    ]);
+
+                    dropzone.textContent = `Loaded ${file.name}`;
+                    dropzone.append(document.createElement('br'));
+                    const span = document.createElement('span');
+                    span.textContent = `${countQuery.data.toRows()[0].num_rows} rows - showing the first few below as a preview`;
+                    dropzone.append(span);
+
+                    const table = MotherDuckFileBrowser.buildTableFromQueryResult(sampleRows.data);
+                    /* Make sure we're cleaning up any old closed drawers first */
+                    Array.from(document.querySelectorAll('.query-result')).forEach(el => el.remove());
+                    
+                    const sample = document.createElement('div');
+                    sample.classList.add('query-result');
+                    sample.open = true;
+                    sample.style.setProperty('--size', '75vw');
+                    sample.append(table);
+                    document.body.append(sample);
+                } catch (err) {
+                    dropzone.classList.add('error');
+                    dropzone.textContent = `Error: ${err.message}`;
+                }
+            });
         });
 
         if (window.location.hash === '#tokenInClipboard=true') {
